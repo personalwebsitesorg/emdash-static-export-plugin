@@ -64,7 +64,7 @@ async function exportToR2AndTriggerBuild(
   // 2. Generate portable snapshot (Local implementation to avoid dependency issues)
   const siteUrl = ctx.site.url || "http://localhost:4321";
   ctx.log.info(`[2/4] Generating snapshot...`);
-  const snapshot = await generateSnapshotInternal(db, { origin: siteUrl });
+  const snapshot = await generateSnapshotInternal(db, { origin: siteUrl }, ctx);
 
   // 3. Transform media URLs
   let json = JSON.stringify(snapshot);
@@ -152,64 +152,83 @@ const EXCLUDED_PREFIXES = [
 const SAFE_OPTIONS_PREFIXES = ["site:"];
 const SAFE_TABLE_NAME = /^[a-z_][a-z0-9_]*$/;
 
-async function generateSnapshotInternal(db: any, opts: { origin?: string }): Promise<Snapshot> {
-  const tableResult = await sql<{ name: string }>`
-    SELECT name FROM sqlite_master 
-    WHERE type = 'table' AND name LIKE 'ec_%'
-  `.execute(db);
+async function generateSnapshotInternal(db: any, opts: { origin?: string }, ctx: PluginContext): Promise<Snapshot> {
+  ctx.log.info("Entering generateSnapshotInternal...");
+  
+  try {
+    const dialect = db?.getExecutor?.()?.adapter?.constructor?.name || "unknown";
+    ctx.log.info(`Database executor dialect: ${dialect}`);
 
-  const allTables = [...tableResult.rows.map((r: any) => r.name), ...SYSTEM_TABLES];
-  const tables: Record<string, any[]> = {};
-  const schema: Record<string, any> = {};
+    ctx.log.info("Querying table names via introspection...");
+    const tableMetadata = await db.introspection.getTables();
+    const allTableNames = tableMetadata.map((t: any) => t.name);
+    
+    ctx.log.info(`Found ${allTableNames.length} total tables in database.`);
+    const contentTables = allTableNames.filter((name: string) => name.startsWith('ec_'));
+    
+    ctx.log.info(`Found ${contentTables.length} content tables (ec_*).`);
+    const allSnapshotTables = [...contentTables, ...SYSTEM_TABLES];
+    const tables: Record<string, any[]> = {};
+    const schema: Record<string, any> = {};
 
-  for (const tableName of allTables) {
-    if (EXCLUDED_PREFIXES.some(p => tableName.startsWith(p))) continue;
-    if (!SAFE_TABLE_NAME.test(tableName)) continue;
-
-    try {
-      const pragmaResult = await sql<any>`PRAGMA table_info(${sql.raw(`"${tableName}"`)})`.execute(db);
-      if (pragmaResult.rows.length === 0) continue;
-
-      const columns = pragmaResult.rows.map((r: any) => r.name);
-      const types: Record<string, string> = {};
-      for (const row of pragmaResult.rows) {
-        types[row.name] = row.type || "TEXT";
+    for (const tableName of allSnapshotTables) {
+      if (allTableNames.indexOf(tableName) === -1) {
+        // Skip system tables that don't exist yet
+        continue;
       }
-      schema[tableName] = { columns, types };
+      if (EXCLUDED_PREFIXES.some(p => tableName.startsWith(p))) continue;
+      if (!SAFE_TABLE_NAME.test(tableName)) continue;
 
-      let query = sql`SELECT * FROM ${sql.raw(`"${tableName}"`)}`;
-      if (tableName.startsWith("ec_")) {
-        query = sql`SELECT * FROM ${sql.raw(`"${tableName}"`)} WHERE deleted_at IS NULL AND status = 'published'`;
-      }
-      
-      let rows = (await (query as any).execute(db)).rows;
+      ctx.log.info(`Querying table schema: ${tableName}`);
+      try {
+        const pragmaResult = await sql<any>`PRAGMA table_info(${sql.raw(`"${tableName}"`)})`.execute(db);
+        if (pragmaResult.rows.length === 0) continue;
 
-      if (tableName === "options") {
-        rows = rows.filter((row: any) => 
-          SAFE_OPTIONS_PREFIXES.some(prefix => (row.name as string).startsWith(prefix))
-        );
-      }
-
-      if (rows.length > 0) {
-        if (opts.origin && tableName.startsWith("ec_")) {
-          rows = rows.map((row: any) => {
-            const newRow = { ...row };
-            for (const [col, val] of Object.entries(newRow)) {
-              if (typeof val === 'string' && val.startsWith('{')) {
-                newRow[col] = injectMediaSrc(val, opts.origin!);
-              }
-            }
-            return newRow;
-          });
+        const columns = pragmaResult.rows.map((r: any) => r.name);
+        const types: Record<string, string> = {};
+        for (const row of pragmaResult.rows) {
+          types[row.name] = row.type || "TEXT";
         }
-        tables[tableName] = rows;
-      }
-    } catch (e) {
-      // Table might not exist yet
-    }
-  }
+        schema[tableName] = { columns, types };
 
-  return { tables, schema, generatedAt: new Date().toISOString() };
+        let query = sql`SELECT * FROM ${sql.raw(`"${tableName}"`)}`;
+        if (tableName.startsWith("ec_")) {
+          query = sql`SELECT * FROM ${sql.raw(`"${tableName}"`)} WHERE deleted_at IS NULL AND status = 'published'`;
+        }
+        
+        const result = await (query as any).execute(db);
+        let rows = result.rows;
+
+        if (tableName === "options") {
+          rows = rows.filter((row: any) => 
+            SAFE_OPTIONS_PREFIXES.some(prefix => (row.name as string).startsWith(prefix))
+          );
+        }
+
+        if (rows.length > 0) {
+          if (opts.origin && tableName.startsWith("ec_")) {
+            rows = rows.map((row: any) => {
+              const newRow = { ...row };
+              for (const [col, val] of Object.entries(newRow)) {
+                if (typeof val === 'string' && val.startsWith('{')) {
+                  newRow[col] = injectMediaSrc(val, opts.origin!);
+                }
+              }
+              return newRow;
+            });
+          }
+          tables[tableName] = rows;
+        }
+      } catch (e) {
+        ctx.log.warn(`Warning: Could not export table ${tableName}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    return { tables, schema, generatedAt: new Date().toISOString() };
+  } catch (err) {
+    ctx.log.error(`Error in generateSnapshotInternal: ${err instanceof Error ? err.stack || err.message : String(err)}`);
+    throw err;
+  }
 }
 
 function injectMediaSrc(jsonStr: string, origin: string): string {
