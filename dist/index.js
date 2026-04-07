@@ -1,75 +1,97 @@
 import { definePlugin } from "emdash";
 import { AwsClient } from "aws4fetch";
-// @ts-ignore - generateSnapshot is an internal API as per instructions
-import { generateSnapshot } from "emdash/dist/api/handlers/snapshot.mjs";
+// These imports resolve through Vite at runtime (the built dist uses
+// hashed chunk names, so direct file paths don't work — Vite maps the
+// package.json "exports" to the correct source/chunk).
+// @ts-ignore — tsdown bundles emdash into flat chunks; TS can't resolve the subpath export
+import { generateSnapshot } from "emdash/api/handlers/snapshot";
 import { getDb } from "emdash/runtime";
 export function createPlugin(options) {
     return definePlugin({
         id: "emdash-static-export",
         version: "1.0.0",
-        // Request minimal capabilities
-        capabilities: ["read:content", "network:fetch"],
+        capabilities: ["read:content", "network:fetch:any"],
         hooks: {
             "content:afterSave": {
-                handler: async (event, ctx) => {
-                    ctx.log.info("Starting non-blocking static export to R2...");
-                    // Execute in the background so it doesn't block the editor
-                    exportToR2AndTriggerBuild(options, ctx).catch((err) => {
-                        ctx.log.error("Static export failed", err);
-                    });
-                }
-            }
-        }
+                // Snapshot + R2 upload can be slow — give it plenty of time
+                timeout: 60_000,
+                // Never fail the content save because the export broke
+                errorPolicy: "continue",
+                handler: async (_event, ctx) => {
+                    ctx.log.info("Starting static export to R2...");
+                    // CRITICAL: await the export — do NOT fire-and-forget.
+                    //
+                    // getDb() reads the DB instance from AsyncLocalStorage (request
+                    // context). If we detach the promise chain (.catch without await),
+                    // the request may complete before getDb() runs, leaving the ALS
+                    // store empty and causing a silent failure or hang.
+                    //
+                    // With errorPolicy:"continue" + high timeout, even though we await,
+                    // the content save still succeeds regardless of export outcome.
+                    try {
+                        await exportToR2AndTriggerBuild(options, ctx);
+                    }
+                    catch (err) {
+                        // errorPolicy:"continue" means the hook pipeline already handles
+                        // this, but log explicitly so it's impossible to miss.
+                        ctx.log.error("Export failed: " +
+                            (err instanceof Error ? err.stack || err.message : String(err)));
+                    }
+                },
+            },
+        },
     });
 }
 export default createPlugin;
+// ─── Background export logic ───────────────────────────────────────
 async function exportToR2AndTriggerBuild(options, ctx) {
-    try {
-        // 1. Generate Snapshot
-        // We pass a dummy origin so generateSnapshot injects the local API path
-        const fakeOrigin = "http://internal-replace";
-        const db = await getDb();
-        // @ts-ignore - explicitly passing kysely DB
-        const snapshot = await generateSnapshot(db, { origin: fakeOrigin });
-        // 2. Transform URLs
-        let json = JSON.stringify(snapshot);
-        const mediaUrlRoot = options.mediaUrl.endsWith('/') ? options.mediaUrl : options.mediaUrl + '/';
-        // Replace the internal URLs with the configured R2 public URL
-        json = json.replaceAll(`${fakeOrigin}/_emdash/api/media/file/`, mediaUrlRoot);
-        // 3. Upload to R2 using aws4fetch
-        const aws = new AwsClient({
-            accessKeyId: options.r2AccessKeyId,
-            secretAccessKey: options.r2SecretAccessKey,
-            region: "auto",
-            service: "s3",
-        });
-        const key = "exports/site-export.json";
-        const endpoint = `https://${options.r2AccountId}.r2.cloudflarestorage.com/${options.r2BucketName}/${key}`;
-        const uploadRes = await aws.fetch(endpoint, {
-            method: "PUT",
-            headers: {
-                "Content-Type": "application/json",
-            },
-            body: json,
-        });
-        if (!uploadRes.ok) {
-            throw new Error(`Failed to upload to R2: HTTP ${uploadRes.status} ${await uploadRes.text()}`);
+    // 1. Obtain DB handle (from ALS request context → cached singleton)
+    ctx.log.info("[1/4] Acquiring database connection...");
+    const db = await getDb();
+    // 2. Generate portable snapshot
+    const siteUrl = ctx.site.url || "http://localhost:4321";
+    ctx.log.info(`[2/4] Generating snapshot (origin: ${siteUrl})...`);
+    const snapshot = await generateSnapshot(db, { origin: siteUrl });
+    // 3. Transform media URLs:
+    //    snapshot has URLs like  {siteUrl}/_emdash/api/media/file/{storageKey}
+    //    replace with the R2 public URL the static site will use.
+    let json = JSON.stringify(snapshot);
+    const mediaUrlRoot = options.mediaUrl.endsWith("/")
+        ? options.mediaUrl
+        : options.mediaUrl + "/";
+    json = json.replaceAll(`${siteUrl}/_emdash/api/media/file/`, mediaUrlRoot);
+    ctx.log.info(`[3/4] Snapshot ready (${(json.length / 1024).toFixed(1)} KB). Uploading to R2...`);
+    // 4. Upload to R2 via S3-compatible API
+    const aws = new AwsClient({
+        accessKeyId: options.r2AccessKeyId,
+        secretAccessKey: options.r2SecretAccessKey,
+        region: "auto",
+        service: "s3",
+    });
+    const key = "exports/site-export.json";
+    const endpoint = `https://${options.r2AccountId}.r2.cloudflarestorage.com/${options.r2BucketName}/${key}`;
+    const uploadRes = await aws.fetch(endpoint, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: json,
+    });
+    if (!uploadRes.ok) {
+        const body = await uploadRes.text().catch(() => "(unreadable)");
+        throw new Error(`R2 upload failed: HTTP ${uploadRes.status} — ${body}`);
+    }
+    ctx.log.info(`[3/4] Uploaded to ${options.r2BucketName}/${key}`);
+    // 5. Trigger deployment webhook
+    if (options.deployHookUrl) {
+        ctx.log.info("[4/4] Triggering deployment webhook...");
+        const res = await fetch(options.deployHookUrl, { method: "POST" });
+        if (!res.ok) {
+            ctx.log.warn(`Webhook returned HTTP ${res.status}`);
         }
-        ctx.log.info(`[emdash-static-export] Uploaded snapshot to R2 bucket: ${options.r2BucketName}/${key}`);
-        // 4. Trigger Webhook
-        if (options.deployHookUrl && ctx.http) {
-            ctx.log.info(`[emdash-static-export] Triggering deployment webhook...`);
-            const res = await ctx.http.fetch(options.deployHookUrl, { method: "POST" });
-            if (!res.ok) {
-                ctx.log.warn(`[emdash-static-export] Webhook failed with status ${res.status}`);
-            }
-            else {
-                ctx.log.info(`[emdash-static-export] Webhook triggered successfully`);
-            }
+        else {
+            ctx.log.info("[4/4] Webhook triggered ✓");
         }
     }
-    catch (error) {
-        ctx.log.error(`[emdash-static-export] Error during export background task: ${error instanceof Error ? error.message : String(error)}`);
-        throw error;
+    else {
+        ctx.log.info("[4/4] No webhook configured — skipping.");
     }
 }
