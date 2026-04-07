@@ -1,0 +1,33 @@
+{
+  "name": "emdash-static-export",
+  "version": "1.0.0",
+  "description": "Emdash plugin to export snapshot JSON to R2 for static builder",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./descriptor": {
+      "types": "./dist/descriptor.d.ts",
+      "import": "./dist/descriptor.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "peerDependencies": {
+    "emdash": "*",
+    "react": "^18.0.0"
+  },
+  "dependencies": {
+    "aws4fetch": "^1.0.20"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  }
+}
