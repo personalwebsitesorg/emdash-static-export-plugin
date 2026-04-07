@@ -15,8 +15,11 @@ A lightweight EmDash CMS plugin that automates the export of site data as a JSON
 - A static frontend builder (e.g., Cloudflare Pages) configured with a **Deploy Webhook URL**.
 
 ## Setup Instructions
-
-1. Include the plugin within your `emdash-static` environment, making sure to build the plugin (`pnpm run build` or `tsc`).
+```bash
+npm install github:personalwebsitesorg/emdash-plugin-deploy-hook
+```
+or
+1. Include the plugin within your `emdash` environment, making sure to build the plugin (`pnpm run build` or `tsc`).
 
 2. Register the plugin within your `astro.config.mjs` where you initialize EmDash:
    ```javascript
