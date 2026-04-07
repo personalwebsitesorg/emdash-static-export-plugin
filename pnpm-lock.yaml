@@ -18,6 +18,9 @@ importers:
         specifier: ^18.0.0
         version: 18.3.1
     devDependencies:
+      kysely:
+        specifier: ^0.28.15
+        version: 0.28.15
       typescript:
         specifier: ^5.3.3
         version: 5.9.3
@@ -1922,6 +1925,10 @@ packages:
   kysely@0.27.6:
     resolution: {integrity: sha512-FIyV/64EkKhJmjgC0g2hygpBv5RNWVPyNCqSAD7eTCv6eFWNIi4PN1UvdSJGicN/o35bnevgis4Y0UDC0qi8jQ==}
     engines: {node: '>=14.0.0'}
+
+  kysely@0.28.15:
+    resolution: {integrity: sha512-r2clcf7HLWvDXaVUEvQymXJY4i3bSOIV3xsL/Upy3ZfSv5HeKsk9tsqbBptLvth5qHEIhxeHTA2jNLyQABkLBA==}
+    engines: {node: '>=20.0.0'}
 
   layerr@3.0.0:
     resolution: {integrity: sha512-tv754Ki2dXpPVApOrjTyRo4/QegVb9eVFq4mjqp4+NM5NaX7syQvN5BBNfV/ZpAHCEHV24XdUVrBAoka4jt3pA==}
@@ -5119,6 +5126,8 @@ snapshots:
   json5@2.2.3: {}
 
   kysely@0.27.6: {}
+
+  kysely@0.28.15: {}
 
   layerr@3.0.0: {}
 
